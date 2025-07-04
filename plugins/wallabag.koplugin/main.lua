@@ -105,11 +105,16 @@ function Wallabag:init()
     self.offline_queue                 = self.wb_settings.data.wallabag.offline_queue or {}
     self.use_local_archive             = self.wb_settings.data.wallabag.use_local_archive or false
 
+    self.file_block_timeout = self.wb_settings.data.wallabag.file_block_timeout or socketutil.FILE_BLOCK_TIMEOUT
+    self.file_total_timeout = self.wb_settings.data.wallabag.file_total_timeout or socketutil.FILE_TOTAL_TIMEOUT
+    self.large_block_timeout = self.wb_settings.data.wallabag.large_block_timeout or socketutil.LARGE_BLOCK_TIMEOUT
+    self.large_total_timeout = self.wb_settings.data.wallabag.large_total_timeout or socketutil.LARGE_TOTAL_TIMEOUT
+
     -- archive_directory only has a default if directory is set
     self.archive_directory = self.wb_settings.data.wallabag.archive_directory
     if not self.archive_directory or self.archive_directory == "" then
         if self.directory and self.directory ~= "" then
-            self.archive_directory = self.directory.."archive/"
+            self.archive_directory = FFIUtil.joinPath(self.directory, "archive")
         end
     end
 
@@ -354,6 +359,67 @@ function Wallabag:addToMainMenu(menu_items)
                         },
                     },
                     {
+                        text = _("Network timeout settings"),
+                        sub_item_table = {
+                            {
+                                text_func = function()
+                                    return T(_("Article download connection timeout: %1 s"), self.file_block_timeout)
+                                end,
+                                keep_menu_open = true,
+                                callback = function(touchmenu_instance)
+                                    self:setTimeoutValue(
+                                        touchmenu_instance,
+                                        _("Article download connection timeout (seconds)"),
+                                        self.file_block_timeout,
+                                        function(value) self.file_block_timeout = value end
+                                    )
+                                end,
+                            },
+                            {
+                                text_func = function()
+                                    return T(_("Article download total timeout: %1 s"), self.file_total_timeout)
+                                end,
+                                keep_menu_open = true,
+                                callback = function(touchmenu_instance)
+                                    self:setTimeoutValue(
+                                        touchmenu_instance,
+                                        _("Article download total timeout (seconds)"),
+                                        self.file_total_timeout,
+                                        function(value) self.file_total_timeout = value end
+                                    )
+                                end,
+                            },
+                            {
+                                text_func = function()
+                                    return T(_("API request connection timeout: %1 s"), self.large_block_timeout)
+                                end,
+                                keep_menu_open = true,
+                                callback = function(touchmenu_instance)
+                                    self:setTimeoutValue(
+                                        touchmenu_instance,
+                                        _("API request connection timeout (seconds)"),
+                                        self.large_block_timeout,
+                                        function(value) self.large_block_timeout = value end
+                                    )
+                                end,
+                            },
+                            {
+                                text_func = function()
+                                    return T(_("API request total timeout: %1 s"), self.large_total_timeout)
+                                end,
+                                keep_menu_open = true,
+                                callback = function(touchmenu_instance)
+                                    self:setTimeoutValue(
+                                        touchmenu_instance,
+                                        _("API request total timeout (seconds)"),
+                                        self.large_total_timeout,
+                                        function(value) self.large_total_timeout = value end
+                                    )
+                                end,
+                            },
+                        }
+                    },
+                    {
                         text = _("History settings"),
                         sub_item_table = {
                             {
@@ -498,11 +564,6 @@ function Wallabag:getBearerToken()
         })
 
         return false
-    end
-
-    -- Add trailing slash if it is missing
-    if string.sub(self.directory, -1) ~= "/" then
-        self.directory = self.directory .. "/"
     end
 
     -- Check if token is valid for at least 5 minutes. If so, no need to renew
@@ -696,7 +757,7 @@ function Wallabag:downloadArticle(article)
         end
     end
 
-    local local_path = self.directory .. article_id_prefix .. article.id .. article_id_postfix .. title .. file_ext
+    local local_path = FFIUtil.joinPath(self.directory, article_id_prefix..article.id..article_id_postfix..title..file_ext)
     logger.dbg("Wallabag:downloadArticle: downloading", article.id, "to", local_path)
 
     local attr = lfs.attributes(local_path)
@@ -761,10 +822,10 @@ function Wallabag:callAPI(method, url, headers, body, filepath, quiet)
 
     if filepath ~= nil then
         request.sink = ltn12.sink.file(io.open(filepath, "w"))
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(self.file_block_timeout, self.file_total_timeout)
     else
         request.sink = ltn12.sink.table(sink)
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(self.large_block_timeout, self.large_total_timeout)
     end
 
     if body ~= nil then
@@ -1018,7 +1079,7 @@ function Wallabag:processRemoteDeletes(remote_ids)
     local count = 0
 
     for entry in lfs.dir(self.directory) do
-        local entry_path = self.directory .. entry
+        local entry_path = FFIUtil.joinPath(self.directory, entry)
 
         if entry ~= "." and entry ~= ".." and lfs.attributes(entry_path, "mode") == "file" then
             local local_id = self:getArticleID(entry_path)
@@ -1067,7 +1128,7 @@ function Wallabag:uploadStatuses(quiet)
             local skip = false
 
             if entry ~= "." and entry ~= ".." then
-                local entry_path = self.directory .. entry
+                local entry_path = FFIUtil.joinPath(self.directory, entry)
 
                 if DocSettings:hasSidecarFile(entry_path) then
                     logger.dbg("Wallabag:uploadStatuses:", entry_path, "has sidecar file")
@@ -1263,7 +1324,7 @@ function Wallabag:archiveLocalArticle(path)
 
     if lfs.attributes(path, "mode") == "file" then
         local _, file = util.splitFilePathName(path)
-        local new_path = self.archive_directory..file
+        local new_path = FFIUtil.joinPath(self.archive_directory, file)
         if FileManager:moveFile(path, new_path) then
             result = 1
         end
@@ -1464,7 +1525,7 @@ function Wallabag:setDownloadDirectory(touchmenu_instance)
         onConfirm = function(path)
             self.directory = path
             self:saveSettings()
-            logger.dbg("Wallabag:setDownloadDirectory: set download directory to", path)
+            logger.dbg("Wallabag:setDownloadDirectory: set download directory to", self.directory)
             if touchmenu_instance then
                 touchmenu_instance:updateItems()
             end
@@ -1478,12 +1539,49 @@ function Wallabag:setArchiveDirectory(touchmenu_instance)
         onConfirm = function(path)
             self.archive_directory = path
             self:saveSettings()
-            logger.dbg("Wallabag:setArchiveDirectory: set archive directory to", path)
+            logger.dbg("Wallabag:setArchiveDirectory: set archive directory to", self.archive_directory)
             if touchmenu_instance then
                 touchmenu_instance:updateItems()
             end
         end,
     }:chooseDir()
+end
+
+function Wallabag:setTimeoutValue(touchmenu_instance, title_text, current_value, setter_func)
+    self.timeout_dialog = InputDialog:new{
+        title = title_text,
+        input = tostring(current_value),
+        input_type = "number", -- For numeric keyboard
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.timeout_dialog)
+                    end,
+                },
+                {
+                    text = _("Set timeout"),
+                    is_enter_default = true,
+                    callback = function()
+                        local new_value = tonumber(self.timeout_dialog:getInputText())
+                        if new_value and new_value > 0 then
+                            setter_func(new_value)
+                            self:saveSettings()
+                            touchmenu_instance:updateItems()
+                            UIManager:close(self.timeout_dialog)
+                        else
+                            UIManager:show(InfoMessage:new{ text = _("Invalid input. Please enter a positive number greater than 0.")})
+                            -- Keep dialog open by not closing it here.
+                        end
+                    end,
+                }
+            }
+        },
+    }
+    UIManager:show(self.timeout_dialog)
+    self.timeout_dialog:onShowKeyboard()
 end
 
 function Wallabag:saveSettings()
@@ -1509,9 +1607,13 @@ function Wallabag:saveSettings()
         remove_read_from_history      = self.remove_read_from_history,
         remove_abandoned_from_history = self.remove_abandoned_from_history,
         download_original_document    = self.download_original_document,
-        offline_queue                  = self.offline_queue,
+        offline_queue                 = self.offline_queue,
         use_local_archive             = self.use_local_archive,
         archive_directory             = self.archive_directory,
+        file_block_timeout            = self.file_block_timeout,
+        file_total_timeout            = self.file_total_timeout,
+        large_block_timeout           = self.large_block_timeout,
+        large_total_timeout           = self.large_total_timeout,
     }
 
     self.wb_settings:saveSetting("wallabag", tempsettings)

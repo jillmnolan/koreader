@@ -12,6 +12,7 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
+local Presets = require("ui/presets")
 local ProgressWidget = require("ui/widget/progresswidget")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local Size = require("ui/size")
@@ -23,6 +24,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local datetime = require("datetime")
 local logger = require("logger")
+local util = require("util")
 local T = require("ffi/util").template
 local _ = require("gettext")
 local C_ = _.pgettext
@@ -49,6 +51,7 @@ local MODE = {
     custom_text = 17,
     book_author = 18,
     page_turning_inverted = 19, -- includes both page-turn-button and swipe-and-tap inversion
+    dynamic_filler = 20,
 }
 
 local symbol_prefix = {
@@ -133,7 +136,8 @@ if BD.mirroredUILayout() then
 end
 
 -- functions that generates footer text for each mode
-local footerTextGeneratorMap = {
+local footerTextGeneratorMap
+footerTextGeneratorMap = {
     empty = function() return "" end,
     frontlight = function(footer)
         local symbol_type = footer.settings.item_prefix
@@ -412,6 +416,51 @@ local footerTextGeneratorMap = {
         local merge = footer.custom_text:gsub(" ", ""):len() == 0
         return footer.custom_text:rep(footer.custom_text_repetitions), merge
     end,
+    dynamic_filler = function(footer)
+        local margin = footer.horizontal_margin
+        if not footer.settings.disable_progress_bar then
+            if footer.settings.progress_bar_position == "alongside" then
+                return
+            end
+            if footer.settings.align == "center" then
+                margin = Screen:scaleBySize(footer.settings.progress_margin_width)
+            end
+        end
+        local max_width = math.floor(footer._saved_screen_width - 2 * margin)
+        -- when the filler is between other items, it replaces the separator
+        local text, is_filler_inside = footer:genAllFooterText(footerTextGeneratorMap.dynamic_filler)
+        local tmp = TextWidget:new{
+            text = text,
+            face = footer.footer_text_face,
+            bold = footer.settings.text_font_bold,
+        }
+        local text_width = tmp:getSize().w
+        tmp:free()
+        if footer.separator_width == nil then
+            tmp = TextWidget:new{
+                text = footer:genSeparator(),
+                face = footer.footer_text_face,
+                bold = footer.settings.text_font_bold,
+            }
+            footer.separator_width = tmp:getSize().w
+            tmp:free()
+        end
+        local separator_width = is_filler_inside and footer.separator_width or 0
+        local filler_space = " "
+        if footer.filler_space_width == nil then
+            tmp = TextWidget:new{
+                text = filler_space,
+                face = footer.footer_text_face,
+                bold = footer.settings.text_font_bold,
+            }
+            footer.filler_space_width = tmp:getSize().w
+            tmp:free()
+        end
+        local filler_nb = math.floor((max_width - text_width + separator_width) / footer.filler_space_width)
+        if filler_nb > 0 then
+            return filler_space:rep(filler_nb), true
+        end
+    end,
 }
 
 local ReaderFooter = WidgetContainer:extend{
@@ -613,6 +662,13 @@ function ReaderFooter:init()
     self.custom_text = G_reader_settings:readSetting("reader_footer_custom_text", "KOReader")
     self.custom_text_repetitions =
         tonumber(G_reader_settings:readSetting("reader_footer_custom_text_repetitions", "1"))
+
+    self.preset_obj = {
+        presets = G_reader_settings:readSetting("footer_presets", {}),
+        dispatcher_name = "load_footer_preset",
+        buildPreset = function() return self:buildPreset() end,
+        loadPreset = function(preset) self:loadPreset(preset) end,
+    }
 end
 
 function ReaderFooter:set_custom_text(touchmenu_instance)
@@ -980,6 +1036,7 @@ function ReaderFooter:textOptionTitles(option)
         custom_text = T(_("Custom text (long-press to edit): \'%1\'%2"), self.custom_text,
             self.custom_text_repetitions > 1 and
             string.format(" × %d", self.custom_text_repetitions) or ""),
+        dynamic_filler = _("Dynamic filler"),
     }
     return option_titles[option]
 end
@@ -1372,6 +1429,7 @@ function ReaderFooter:addToMainMenu(menu_items)
     table.insert(footer_items, getMinibarOption("book_title"))
     table.insert(footer_items, getMinibarOption("book_chapter"))
     table.insert(footer_items, getMinibarOption("custom_text"))
+    table.insert(footer_items, getMinibarOption("dynamic_filler"))
 
     -- configure footer_items
     table.insert(sub_items, {
@@ -1492,16 +1550,9 @@ With this feature enabled, the current page is factored in, resulting in the cou
                                 keep_shown_on_apply = true,
                                 callback = function(spin)
                                     self.settings.text_font_size = spin.value
-                                    self.footer_text_face = Font:getFace(self.text_font_face, self.settings.text_font_size)
-                                    self.footer_text:free()
-                                    self.footer_text = TextWidget:new{
-                                        text = self.footer_text.text,
-                                        face = self.footer_text_face,
-                                        bold = self.settings.text_font_bold,
-                                    }
-                                    self.text_container[1] = self.footer_text
+                                    self:updateFooterFont()
                                     self:refreshFooter(true, true)
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    touchmenu_instance:updateItems()
                                 end,
                             }
                             UIManager:show(items_font)
@@ -1515,13 +1566,7 @@ With this feature enabled, the current page is factored in, resulting in the cou
                         end,
                         callback = function()
                             self.settings.text_font_bold = not self.settings.text_font_bold
-                            self.footer_text:free()
-                            self.footer_text = TextWidget:new{
-                                text = self.footer_text.text,
-                                face = self.footer_text_face,
-                                bold = self.settings.text_font_bold,
-                            }
-                            self.text_container[1] = self.footer_text
+                            self:updateFooterFont()
                             self:refreshFooter(true, true)
                         end,
                     },
@@ -1666,6 +1711,13 @@ With this feature enabled, the current page is factored in, resulting in the cou
         })
     end
     table.insert(sub_items, {
+        text = _("Status bar presets"),
+        separator = true,
+        sub_item_table_func = function()
+            return Presets.genPresetMenuItemTable(self.preset_obj, nil, nil)
+        end,
+    })
+    table.insert(sub_items, {
         text = _("Show status bar separator"),
         checked_func = function()
             return self.settings.bottom_horizontal_separator == true
@@ -1801,6 +1853,9 @@ function ReaderFooter:genItemSymbolsMenuItems(value)
         end,
         callback = function()
             self.settings.item_prefix = value
+            if self.settings.items_separator == "none" then
+                self.separator_width = nil
+            end
             self:refreshFooter(true)
         end,
     }
@@ -1823,6 +1878,7 @@ function ReaderFooter:genItemSeparatorMenuItems(value)
         end,
         callback = function()
             self.settings.items_separator = value
+            self.separator_width = nil
             self:refreshFooter(true)
         end,
     }
@@ -1878,6 +1934,49 @@ function ReaderFooter:genAlignmentMenuItems(value)
     }
 end
 
+function ReaderFooter:buildPreset()
+    return {
+        footer = util.tableDeepCopy(self.settings),
+        reader_footer_mode = self.mode,
+        reader_footer_custom_text = self.custom_text,
+        reader_footer_custom_text_repetitions = self.custom_text_repetitions,
+    }
+end
+
+function ReaderFooter:loadPreset(preset)
+    local old_text_font_size = self.settings.text_font_size
+    local old_text_font_bold = self.settings.text_font_bold
+    G_reader_settings:saveSetting("footer", util.tableDeepCopy(preset.footer))
+    G_reader_settings:saveSetting("reader_footer_mode", preset.reader_footer_mode)
+    G_reader_settings:saveSetting("reader_footer_custom_text", preset.reader_footer_custom_text)
+    G_reader_settings:saveSetting("reader_footer_custom_text_repetitions", preset.reader_footer_custom_text_repetitions)
+    self.settings = G_reader_settings:readSetting("footer")
+    self.mode_index = self.settings.order or self.mode_index
+    self.custom_text = preset.reader_footer_custom_text
+    self.custom_text_repetitions = tonumber(preset.reader_footer_custom_text_repetitions)
+    self:applyFooterMode(preset.reader_footer_mode)
+    self:updateFooterTextGenerator()
+    if old_text_font_size ~= self.settings.text_font_size or old_text_font_bold ~= self.settings.text_font_bold then
+        self:updateFooterFont()
+    else
+        self.separator_width = nil
+        self.filler_space_width = nil
+    end
+    self:setTocMarkers()
+    self:refreshFooter(true, true)
+end
+
+function ReaderFooter:onLoadFooterPreset(preset_name)
+    return Presets.onLoadPreset(self.preset_obj, preset_name, true)
+end
+
+function ReaderFooter.getPresets() -- for Dispatcher
+    local footer_config = {
+        presets = G_reader_settings:readSetting("footer_presets", {})
+    }
+    return Presets.getPresets(footer_config)
+end
+
 function ReaderFooter:addAdditionalFooterContent(content_func)
     table.insert(self.additional_footer_content, content_func)
 end
@@ -1922,17 +2021,24 @@ function ReaderFooter:genSeparator()
         or (self.settings.item_prefix == "compact_items" and " " or "  ")
 end
 
-function ReaderFooter:genAllFooterText()
+function ReaderFooter:genAllFooterText(gen_to_skip)
     local info = {}
     -- We need to BD.wrap() all items and separators, so we're
     -- sure they are laid out in our order (reversed in RTL),
     -- without ordering by the RTL Bidi algorithm.
-    local prev_had_merge
+    local count = 0 -- total number of visible items
+    local skipped_idx, prev_had_merge
     for _, gen in ipairs(self.footerTextGenerators) do
+        if gen == gen_to_skip then
+            count = count + 1
+            skipped_idx = count
+            goto continue
+        end
         -- Skip empty generators, so they don't generate bogus separators
         local text, merge = gen(self)
         if text and text ~= "" then
-            if self.settings.item_prefix == "compact_items" then
+            count = count + 1
+            if self.settings.item_prefix == "compact_items" and gen ~= footerTextGeneratorMap.dynamic_filler then
                 -- remove whitespace from footer items if symbol_type is compact_items
                 -- use a hair-space to avoid issues with RTL display
                 text = text:gsub("%s", "\u{200A}")
@@ -1950,8 +2056,9 @@ function ReaderFooter:genAllFooterText()
                 table.insert(info, BD.wrap(text))
             end
         end
+        ::continue::
     end
-    return table.concat(info, BD.wrap(self:genSeparator()))
+    return table.concat(info, BD.wrap(self:genSeparator())), skipped_idx ~= 1 and skipped_idx ~= count
 end
 
 function ReaderFooter:setTocMarkers(reset)
@@ -2056,6 +2163,19 @@ function ReaderFooter:updateFooterPos(force_repaint, full_repaint)
         self.progress_bar:setPercentage(self.position / self.doc_height)
     end
     self:updateFooterText(force_repaint, full_repaint)
+end
+
+function ReaderFooter:updateFooterFont()
+    self.separator_width = nil
+    self.filler_space_width = nil
+    self.footer_text_face = Font:getFace(self.text_font_face, self.settings.text_font_size)
+    self.footer_text:free()
+    self.footer_text = TextWidget:new{
+        text = self.footer_text.text,
+        face = self.footer_text_face,
+        bold = self.settings.text_font_bold,
+    }
+    self.text_container[1] = self.footer_text
 end
 
 -- updateFooterText will start as a noop. After onReaderReady event is
